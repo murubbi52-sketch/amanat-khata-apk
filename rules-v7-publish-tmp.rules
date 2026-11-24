@@ -1,0 +1,666 @@
+rules_version = '2';
+// Rules v7 (2.87, 2026-11-24) — council full-audit round 1.
+// Deltas from v6: pair-cooldown gate removed (abolished in 2.84);
+// pairs writes pinned to the writer's own removedBy key; proposal
+// creation closed (field set, handover never born confirmed,
+// entry amount validated); resend pins handoverStatus; timeline
+// events closed (type whitelist, field set, sane clock); expired
+// invites can no longer change state. Everything else is v6.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Each signed-in user can read/write only their own data.
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+    // Announcements: any signed-in user can read; only the admin can post/edit.
+    match /announcements/{docId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.token.email == 'murubbi52@gmail.com';
+    }
+    // Member ID public profiles (2.27, Phase A; design-userid-v1.md):
+    // a card carrying ONLY {uid, name, code, updatedAt}, keyed by the
+    // owner's member NUMBER — the {code} path variable and the card's
+    // `code` field both hold that number as a string. Since v5
+    // (2.39, owner's decision on the joint audit) the number is a
+    // RANDOM 6-digit draw (100000-999999), not the retired
+    // sequential counter: sequential numbers let strangers walk
+    // 101, 102, 103... and harvest names; a random 6-digit number
+    // is short, uniform for everyone, and unguessable.
+    //
+    // Reads are split on purpose:
+    //   get  — any signed-in user may fetch ONE card by its exact
+    //          number (that is how member search works: an exact
+    //          doc-get, and all it can ever reveal is a name);
+    //   list — DENIED for everyone. Nobody can enumerate or scan
+    //          the collection, so the member directory as a whole
+    //          is never exposed.
+    //
+    // Writes: only the owner can create or update their own card.
+    // The document must contain EXACTLY the four fields userid.js
+    // writes (profileDoc), the uid inside must be the caller's own
+    // uid (and, on update, unchanged), and the code inside must
+    // equal the number in the path. Nobody can delete a card: a
+    // member number, once issued, is permanent.
+    match /publicProfiles/{code} {
+      allow get: if request.auth != null;
+      allow list: if false;
+      // A card may only be created at a well-formed 6-digit member
+      // number (v5). The create is create-if-absent by Firestore
+      // semantics (a create on an existing doc fails), and the
+      // card's uid must be the creator's own — so the worst a
+      // squatter can do is occupy a random number with a card
+      // naming THEMSELVES; the victim's client just draws again.
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['uid', 'name', 'code', 'updatedAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'code', 'updatedAt'])
+        && request.resource.data.uid is string
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.code is string
+        && request.resource.data.code == code
+        && (request.resource.data.updatedAt is string || request.resource.data.updatedAt == null)
+        && code.matches('^[1-9][0-9]{5}$');
+      allow update: if request.auth != null
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasAll(['uid', 'name', 'code', 'updatedAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'code', 'updatedAt'])
+        && request.resource.data.uid is string
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.code is string
+        && request.resource.data.code == code
+        && request.resource.data.code == resource.data.code
+        && (request.resource.data.updatedAt is string || request.resource.data.updatedAt == null);
+      allow delete: if false;
+    }
+    // Member-number counter — RETIRED in v5 (2.39). Sequential
+    // allocation is gone; numbers are random 6-digit draws claimed
+    // by create-if-absent (see publicProfiles above). The counter
+    // doc may still exist in old data; nothing may touch it.
+    match /counters/memberNumbers {
+      allow read, write: if false;
+    }
+    // ============================================================
+    // v4 ADDITIONS — যৌথ সম্মতি (Joint Consent), step 3.
+    // PUBLISHED as Rules v4 on 2026-10-30 (Firebase Console).
+    // Everything below the v3 base is additive only.
+    // v5 (2.39) changes ONLY the member-number scheme above:
+    // publicProfiles create shape + the retired counter block.
+    // Design: design-consent-v1.md (flow + states),
+    // design-consent-safety-v1.md §9 (what Rules can and cannot
+    // enforce on Spark), council final-decision-safety.md (the
+    // locked synthesis), owner's locked decisions 2026-10-28:
+    //   1. witness is name-only (never a confirmer);
+    //   2. money handover is a SEPARATE confirmation, by the
+    //      receiving side only, independent of consent status;
+    //   3. proposal expiry 7 days; expiry never ends a debt —
+    //      a resend is a new version with a new expiry;
+    //   4. payment proposals are notify-mode by default; consent
+    //      becomes mandatory only for disputed / corrected /
+    //      other-party-affecting payments.
+    //
+    // Enforced HERE (server-side, a tampered client cannot pass):
+    // participation, no self-consent, version-locked consent,
+    // payload immutability on transitions, append-only timeline,
+    // block check, sanction check, verified-email requirement
+    // for sending, admin-only
+    // sanctions/reports-decisions, dispute-note length cap.
+    // Enforced at APP level (Rules cannot count — safety §9.2):
+    // daily send/search counts, probation's lower daily caps,
+    // pending-count caps. Those writes still land in these
+    // collections, so abuse is visible to the admin afterwards.
+    // ============================================================
+
+    // Is there an ACTIVE block doc blocker -> blocked?
+    function hkBlockActive(blocker, blocked) {
+      return exists(/databases/$(database)/documents/blocks/$(blocker + '_' + blocked))
+        && get(/databases/$(database)/documents/blocks/$(blocker + '_' + blocked)).data.active == true;
+    }
+    function hkBlockedEitherWay(a, b) {
+      return hkBlockActive(a, b) || hkBlockActive(b, a);
+    }
+    // Is uid under an ACTIVE sanction whose time has not run out?
+    // endsAt == null means indefinite.
+    function hkSanctioned(uid) {
+      return exists(/databases/$(database)/documents/sanctions/$(uid))
+        && get(/databases/$(database)/documents/sanctions/$(uid)).data.active == true
+        && (get(/databases/$(database)/documents/sanctions/$(uid)).data.endsAt == null
+            || get(/databases/$(database)/documents/sanctions/$(uid)).data.endsAt > request.time);
+    }
+    function hkIsAdmin() {
+      return request.auth != null && request.auth.token.email == 'murubbi52@gmail.com';
+    }
+    function hkPairDoc(pairId) {
+      return get(/databases/$(database)/documents/pairs/$(pairId)).data;
+    }
+    // Pair cooldown: REMOVED in v7 (2.87, council full-audit R1,
+    // ChatGPT 3.4). The 2.84 council decision abolished the pair
+    // cooldown system (a dispute now holds only the identical claim);
+    // v6 still carried the dormant gate. It is gone for good — no
+    // client writes cooldownUntil, and no rule reads it.
+    // Helper for the pairs update rule below: the OTHER
+    // participant's removedBy entry must come through untouched.
+    function hkOtherRemovedByUnchanged(before, after, uid) {
+      let other = before.participants[0] == uid ? before.participants[1] : before.participants[0];
+      return after.get('removedBy', {}).get(other, null) == before.get('removedBy', {}).get(other, null);
+    }
+
+    // Consent profile (probation clock): the FIRST time a member
+    // approaches the consent system the client stamps this doc
+    // once; it can never be rewritten, so the 7-day probation
+    // window (app-level caps) has a tamper-proof start. Only the
+    // start is provable here — the caps themselves are counts,
+    // which Rules cannot keep (safety §9.2).
+    match /consentProfiles/{uid} {
+      allow get: if request.auth != null && (request.auth.uid == uid || hkIsAdmin());
+      allow list: if false;
+      allow create: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['createdAt'])
+        && request.resource.data.createdAt is timestamp;
+      allow update, delete: if false;
+    }
+
+    // Pair state (safety §9.4): one doc per pair, id = the two
+    // uids sorted and joined with '_' — the same id as the pair's
+    // consent thread. Holds the pair's removedBy map (2.86: each
+    // participant's own "removed from my book" stamp). v7: a
+    // participant's write may touch only their own removedBy key;
+    // the admin may set the doc freely.
+    match /pairs/{pairId} {
+      allow get: if request.auth != null
+        && (request.auth.uid in resource.data.participants || hkIsAdmin());
+      // v6 (2.67, council round 2): pair DISCOVERY — a participant
+      // may list the pairs they belong to (the client queries
+      // participants array-contains own uid, so the rule is met
+      // per returned doc). v4/v5 denied list outright, which
+      // silently killed new-phone pair discovery (QA F1). The
+      // pair doc stays a pure discovery index: it grants no
+      // access to any thread, proposal or ledger data.
+      allow list: if request.auth != null
+        && (request.auth.uid in resource.data.participants || hkIsAdmin());
+      // v6: creation additionally requires the pair's consent
+      // thread to already exist — a thread is only created
+      // inside a real proposal flow, so a lone actor can no
+      // longer mint a phantom pair naming a stranger.
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['participants'])
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.resource.data.participants[0] < request.resource.data.participants[1]
+        && pairId == request.resource.data.participants[0] + '_' + request.resource.data.participants[1]
+        && request.auth.uid in request.resource.data.participants
+        && exists(/databases/$(database)/documents/consentThreads/$(pairId))
+        // v7 (2.87): a removedBy map written at creation may carry
+        // only the creator's OWN key — never the partner's.
+        && request.resource.data.get('removedBy', {}).keys().hasOnly([request.auth.uid]);
+      allow update: if request.auth != null
+        && request.resource.data.participants == resource.data.participants
+        && (hkIsAdmin()
+            || (request.auth.uid in resource.data.participants
+                // v7 (2.87, council full-audit R1: ChatGPT 3.1 +
+                // Gemini 1B-2 P0-2): a participant's write may touch
+                // ONLY the removedBy map, and inside it ONLY their
+                // own key — the partner's key must come through
+                // byte-identical. (v6 let a participant rewrite the
+                // whole map, the partner's entry included; the
+                // cooldownUntil clause is gone with the cooldown
+                // system itself — the field is frozen for
+                // participants, as is every other field.)
+                && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['removedBy'])
+                && hkOtherRemovedByUnchanged(resource.data, request.resource.data, request.auth.uid)));
+      allow delete: if false;
+    }
+
+    // Blocks (safety §3 + §9.4): id = blocker_blocked. The blocker
+    // picks a reason (1–5, mandatory). Effect is enforced at
+    // proposal/invite creation below (hkBlockedEitherWay), in
+    // BOTH directions. Recorded history is never touched by a
+    // block. Read: the blocker and the admin — NOT the blocked
+    // member (final-decision-safety §2: the other side is not
+    // informed; they only meet the neutral send-time message).
+    match /blocks/{blockId} {
+      allow get: if request.auth != null
+        && (request.auth.uid == resource.data.blocker || hkIsAdmin());
+      allow list: if request.auth != null
+        && (resource.data.blocker == request.auth.uid || hkIsAdmin());
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['blocker', 'blocked', 'reason', 'active', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['blocker', 'blocked', 'reason', 'note', 'active', 'createdAt', 'updatedAt'])
+        && request.resource.data.blocker == request.auth.uid
+        && request.resource.data.blocked is string
+        && request.resource.data.blocked != request.auth.uid
+        && blockId == request.resource.data.blocker + '_' + request.resource.data.blocked
+        && request.resource.data.reason is int
+        && request.resource.data.reason >= 1 && request.resource.data.reason <= 5
+        && request.resource.data.active == true;
+      allow update: if request.auth != null
+        && (hkIsAdmin()
+            || (request.auth.uid == resource.data.blocker
+                && request.resource.data.blocker == resource.data.blocker
+                && request.resource.data.blocked == resource.data.blocked
+                && request.resource.data.reason == resource.data.reason));
+      allow delete: if false;
+    }
+
+    // Invites (consent-v1 §1 + userid update: member-ID is the
+    // primary path, a WhatsApp link carrying the code is the
+    // fallback). The doc id IS the unguessable code: opening the
+    // link / typing the code is a single doc get. An invite binds
+    // either a uid (ID path) or an email (link path); the email
+    // path may only be claimed by the verified owner of that
+    // email — the same condition consent-v1 set for acceptance.
+    match /invites/{code} {
+      // GET by exact code is open to any signed-in member: the
+      // code itself is the capability (it travels inside the
+      // WhatsApp link, and is generated with a CSPRNG by the
+      // client). LIST stays restricted below — nobody can browse
+      // or enumerate invites.
+      allow get: if request.auth != null;
+      allow list: if request.auth != null
+        && (resource.data.from == request.auth.uid
+            || resource.data.toUid == request.auth.uid
+            || resource.data.toEmail == request.auth.token.email
+            || hkIsAdmin());
+      allow create: if request.auth != null
+        && request.auth.token.email_verified == true
+        && request.resource.data.keys().hasAll(['from', 'status', 'createdAt', 'expiresAt'])
+        && request.resource.data.keys().hasOnly(['from', 'fromName', 'toUid', 'toEmail', 'status', 'createdAt', 'expiresAt'])
+        && request.resource.data.from == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && (request.resource.data.get('toUid', null) == null || request.resource.data.toUid != request.auth.uid)
+        && !hkSanctioned(request.auth.uid)
+        && (request.resource.data.get('toUid', null) == null
+            || !hkBlockedEitherWay(request.auth.uid, request.resource.data.toUid));
+      allow update: if request.auth != null
+        && resource.data.status == 'pending'
+        && request.time < resource.data.expiresAt
+        && request.resource.data.from == resource.data.from
+        && request.resource.data.createdAt == resource.data.createdAt
+        && ((request.auth.uid == resource.data.from
+             && request.resource.data.status == 'cancelled')
+            || (request.resource.data.status in ['accepted', 'declined']
+                && (resource.data.toUid == request.auth.uid
+                    || (resource.data.get('toEmail', null) != null
+                        && resource.data.toEmail == request.auth.token.email
+                        && request.auth.token.email_verified == true)
+                    // LINK CLAIM: an invite bound to nobody yet
+                    // (it travelled as a link) may be claimed by
+                    // whoever holds the code — claiming binds it
+                    // to the claimer's uid in the same write.
+                    || (resource.data.get('toUid', null) == null
+                        && resource.data.get('toEmail', null) == null
+                        && request.resource.data.get('toUid', null) == request.auth.uid))));
+      allow delete: if false;
+    }
+
+    // The pair's joint thread (consent-v1 §2): exactly the two
+    // participants can read it; nobody else can even learn it
+    // exists. id = sorted uids joined with '_' (same as pairs).
+    match /consentThreads/{pairId} {
+      allow get: if request.auth != null
+        && (request.auth.uid in resource.data.participants || hkIsAdmin());
+      allow list: if false;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['participants', 'createdBy', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['participants', 'createdBy', 'createdAt'])
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.resource.data.participants[0] < request.resource.data.participants[1]
+        && pairId == request.resource.data.participants[0] + '_' + request.resource.data.participants[1]
+        && request.resource.data.createdBy == request.auth.uid
+        && request.auth.uid in request.resource.data.participants
+        && !hkBlockedEitherWay(request.resource.data.participants[0], request.resource.data.participants[1]);
+      allow update, delete: if false;
+
+      // Proposals inside the thread. One doc per PRESENTATION
+      // lineage: resending after a dispute edits the same doc —
+      // version increments, status returns to pending — and the
+      // timeline (below) keeps every step forever. Consent binds
+      // to the exact version agreed (version-lock): a transition
+      // may never change the payload, the version, or the parties.
+      match /proposals/{proposalId} {
+        allow get: if request.auth != null
+          && (request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+              || hkIsAdmin());
+        allow list: if request.auth != null
+          && (request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+              || hkIsAdmin());
+        allow create: if request.auth != null
+          && request.auth.token.email_verified == true
+          && request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && request.resource.data.keys().hasAll(['from', 'to', 'kind', 'consentMode', 'version', 'presentations', 'status', 'entry', 'payerUid', 'receiverUid', 'createdAt', 'expiresAt'])
+          && request.resource.data.from == request.auth.uid
+          && request.resource.data.to in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && request.resource.data.to != request.auth.uid
+          && request.resource.data.kind in ['loan', 'payment', 'correction', 'void']
+          && request.resource.data.consentMode in ['consent', 'notify']
+          && (request.resource.data.kind == 'payment' || request.resource.data.consentMode == 'consent')
+          && request.resource.data.version == 1
+          && request.resource.data.presentations == 1
+          && ((request.resource.data.consentMode == 'consent' && request.resource.data.status == 'pending')
+              || (request.resource.data.consentMode == 'notify' && request.resource.data.status == 'shared'))
+          && request.resource.data.entry is map
+          && request.resource.data.payerUid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && request.resource.data.receiverUid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && request.resource.data.payerUid != request.resource.data.receiverUid
+          && request.resource.data.expiresAt is timestamp
+          && request.resource.data.expiresAt > request.time
+          && !hkSanctioned(request.auth.uid)
+          && !hkBlockedEitherWay(request.resource.data.from, request.resource.data.to)
+          // v7 (2.87, council full-audit R1: ChatGPT 1.2/3.3 +
+          // Gemini 1B-2 P0-1/P1-5): a proposal is born clean or
+          // not at all — closed field set, handover NEVER born
+          // confirmed (the notify-payment forgery: a payment
+          // created already-'confirmed' erased a real debt with
+          // no confirmation step), no pre-stamped agreement, and
+          // a validated entry amount.
+          && request.resource.data.keys().hasOnly(['id', 'pairId', 'from', 'to', 'kind', 'consentMode', 'version', 'presentations', 'status', 'entry', 'payerUid', 'receiverUid', 'createdAt', 'expiresAt', 'handoverStatus', 'agreedVersion'])
+          && request.resource.data.get('handoverStatus', 'unconfirmed') == 'unconfirmed'
+          && request.resource.data.get('agreedVersion', 0) == 0
+          && request.resource.data.entry.amountMinor is int
+          && request.resource.data.entry.amountMinor > 0
+          && request.resource.data.entry.date is string;
+        // Transitions. Every branch pins the fields it may touch;
+        // anything not listed stays byte-identical to the stored
+        // doc (payload, parties, kind, entry, createdAt, witness).
+        allow update: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && !hkBlockedEitherWay(resource.data.from, resource.data.to)
+          && request.resource.data.from == resource.data.from
+          && request.resource.data.to == resource.data.to
+          && request.resource.data.kind == resource.data.kind
+          && request.resource.data.consentMode == resource.data.consentMode
+          && request.resource.data.entry == resource.data.entry
+          && request.resource.data.payerUid == resource.data.payerUid
+          && request.resource.data.receiverUid == resource.data.receiverUid
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.get('witnessName', '') == resource.data.get('witnessName', '')
+          && (
+            // AGREE — only the addressee, only while pending, only
+            // before expiry, on the exact stored version; consent
+            // stamps agreedVersion = that version. The dispute and
+            // handover fields stay exactly as they were.
+            (resource.data.status == 'pending'
+             && request.resource.data.status == 'agreed'
+             && request.auth.uid == resource.data.to
+             && request.resource.data.version == resource.data.version
+             && request.resource.data.presentations == resource.data.presentations
+             && request.resource.data.get('agreedVersion', 0) == resource.data.version
+             && request.resource.data.get('disputeReason', '') == resource.data.get('disputeReason', '')
+             && request.resource.data.get('disputeNote', '') == resource.data.get('disputeNote', '')
+             && request.resource.data.get('handoverStatus', 'unconfirmed') == resource.data.get('handoverStatus', 'unconfirmed')
+             && request.time < resource.data.expiresAt)
+            // DISPUTE — only the addressee (of a pending consent
+            // proposal, or of a shared notify payment). The note
+            // is capped at 100 chars so the note itself can never
+            // become the harassment channel.
+            || (resource.data.status in ['pending', 'shared']
+                && request.resource.data.status == 'disputed'
+                && resource.data.presentations < 3
+                && request.auth.uid == resource.data.to
+                && request.resource.data.version == resource.data.version
+                && request.resource.data.presentations == resource.data.presentations
+                && request.resource.data.get('disputeNote', '') is string
+                && request.resource.data.get('disputeNote', '').size() <= 100
+                && request.resource.data.get('agreedVersion', 0) == resource.data.get('agreedVersion', 0)
+                && request.resource.data.get('handoverStatus', 'unconfirmed') == resource.data.get('handoverStatus', 'unconfirmed'))
+            // THIRD DISPUTE — the same act at the third
+            // presentation closes this entry's path instead
+            // (deadlocked; reopenable — see below and the admin
+            // rule — never a permanent or silent lock).
+            || (resource.data.status in ['pending', 'shared']
+                && request.resource.data.status == 'deadlocked'
+                && resource.data.presentations >= 3
+                && request.auth.uid == resource.data.to
+                && request.resource.data.version == resource.data.version
+                && request.resource.data.presentations == resource.data.presentations
+                && request.resource.data.get('disputeNote', '') is string
+                && request.resource.data.get('disputeNote', '').size() <= 100)
+            // WITHDRAW — only the proposer, only while undecided.
+            || (resource.data.status in ['pending', 'shared']
+                && request.resource.data.status == 'withdrawn'
+                && request.auth.uid == resource.data.from
+                && request.resource.data.version == resource.data.version
+                && request.resource.data.presentations == resource.data.presentations
+                && request.resource.data.get('agreedVersion', 0) == resource.data.get('agreedVersion', 0)
+                && request.resource.data.get('handoverStatus', 'unconfirmed') == resource.data.get('handoverStatus', 'unconfirmed'))
+            // EXPIRE — either participant, only once the 7 days
+            // have actually run out on the server's clock.
+            || (resource.data.status == 'pending'
+                && request.resource.data.status == 'expired'
+                && request.time >= resource.data.expiresAt
+                && request.resource.data.version == resource.data.version
+                && request.resource.data.presentations == resource.data.presentations
+                && request.resource.data.get('agreedVersion', 0) == resource.data.get('agreedVersion', 0)
+                && request.resource.data.get('handoverStatus', 'unconfirmed') == resource.data.get('handoverStatus', 'unconfirmed'))
+            // HANDOVER — the receiving side alone confirms the
+            // money physically changed hands; independent of the
+            // consent status, and never by the payer. Only the
+            // handover fields may move in this branch.
+            || (resource.data.status in ['agreed', 'shared']
+                && request.resource.data.status == resource.data.status
+                && request.resource.data.version == resource.data.version
+                && request.resource.data.presentations == resource.data.presentations
+                && request.auth.uid == resource.data.receiverUid
+                && resource.data.get('handoverStatus', 'unconfirmed') == 'unconfirmed'
+                && request.resource.data.get('handoverStatus', '') == 'confirmed'
+                && request.resource.data.get('agreedVersion', 0) == resource.data.get('agreedVersion', 0)
+                && request.resource.data.get('disputeReason', '') == resource.data.get('disputeReason', '')
+                && request.resource.data.get('disputeNote', '') == resource.data.get('disputeNote', ''))
+            // REOPEN a deadlocked entry — the RECIPIENT alone may
+            // reopen it: back to disputed AND the presentation
+            // streak resets to 1 (their deliberate act starts a
+            // fresh allowance; the version counter never resets,
+            // so version-lock is unaffected). The admin path is
+            // the rule below.
+            || (resource.data.status == 'deadlocked'
+                && request.resource.data.status == 'disputed'
+                && request.auth.uid == resource.data.to
+                && request.resource.data.version == resource.data.version
+                && (request.resource.data.presentations == resource.data.presentations
+                    || request.resource.data.presentations == 1))
+          );
+        // RESEND is a separate rule because it — alone — may
+        // change the payload: after a dispute the proposer fixes
+        // the entry and presents it again as version+1 with a
+        // fresh 7-day expiry (owner decision 3: a new version
+        // gets a new expiry; expiry never cancels the debt).
+        allow update: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && !hkBlockedEitherWay(resource.data.from, resource.data.to)
+          && resource.data.status == 'disputed'
+          && request.resource.data.status == 'pending'
+          && request.auth.uid == resource.data.from
+          && request.resource.data.from == resource.data.from
+          && request.resource.data.to == resource.data.to
+          && request.resource.data.kind == resource.data.kind
+          && (request.resource.data.consentMode == resource.data.consentMode
+              || (resource.data.consentMode == 'notify' && request.resource.data.consentMode == 'consent'))
+          && request.resource.data.payerUid == resource.data.payerUid
+          && request.resource.data.receiverUid == resource.data.receiverUid
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.version == resource.data.version + 1
+          && request.resource.data.presentations == resource.data.presentations + 1
+          && request.resource.data.presentations <= 3
+          && request.resource.data.expiresAt is timestamp
+          && request.resource.data.expiresAt > request.time
+          && !hkSanctioned(request.auth.uid)
+          && !hkBlockedEitherWay(resource.data.from, resource.data.to)
+          // v7 (2.87): a resend may correct the entry but may NOT
+          // smuggle a confirmed handover past the receiver — the
+          // field stays exactly as stored, and the corrected
+          // amount is validated like a creation's.
+          && request.resource.data.get('handoverStatus', 'unconfirmed') == resource.data.get('handoverStatus', 'unconfirmed')
+          && request.resource.data.entry.amountMinor is int
+          && request.resource.data.entry.amountMinor > 0;
+        // The admin may repair a deadlocked/disputed path after a
+        // support review (final-decision-safety §4) — nothing else
+        // about a proposal is ever admin-writable.
+        allow update: if hkIsAdmin()
+          && resource.data.status in ['deadlocked', 'disputed']
+          && request.resource.data.status == 'disputed'
+          && request.resource.data.from == resource.data.from
+          && request.resource.data.to == resource.data.to
+          && request.resource.data.entry == resource.data.entry
+          && request.resource.data.version == resource.data.version
+          && (request.resource.data.get('presentations', 0) == resource.data.presentations
+              || request.resource.data.get('presentations', 0) == 1);
+        allow delete: if false;
+      }
+
+      // The immutable timeline: events are only ever ADDED by a
+      // participant, about their own act; never edited, never
+      // deleted — not even by the admin (consent-v1 §2).
+      match /events/{eventId} {
+        allow get, list: if request.auth != null
+          && (request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+              || hkIsAdmin());
+        allow create: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants
+          && !hkBlockedEitherWay(get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants[0], get(/databases/$(database)/documents/consentThreads/$(pairId)).data.participants[1])
+          && request.resource.data.keys().hasAll(['type', 'by', 'at'])
+          && request.resource.data.by == request.auth.uid
+          && request.resource.data.at is timestamp
+          // v7 (2.87, council full-audit R1: ChatGPT 1.3/3.2 +
+          // Gemini 1B-2 P0-3): the timeline is closed — only the
+          // event types the state machine itself emits, only the
+          // fields the client writes, and a sane clock: an event
+          // stamped in the far future used to poison every
+          // watermark downstream of it.
+          && request.resource.data.keys().hasOnly(['type', 'by', 'at', 'proposalId', 'version'])
+          && request.resource.data.type in ['proposed', 'shared', 'resent', 'agreed', 'disputed', 'deadlocked', 'withdrawn', 'expired', 'reopened', 'handover-confirmed', 'handover', 'withdrawn-by-block', 'dispute-resolved', 'dispute-withdrawn', 'claim-withdrawn']
+          && request.resource.data.at <= request.time + duration.value(1, 'h')
+          && request.resource.data.at >= request.time - duration.value(366, 'd')
+          && (request.resource.data.get('proposalId', null) == null || request.resource.data.proposalId is string)
+          && (request.resource.data.get('version', null) == null || request.resource.data.version is int);
+        allow update, delete: if false;
+      }
+    }
+
+    // Reports (safety §4 + final-decision §3): the client sends
+    // only identifiers — threadId / proposalId — never "evidence
+    // text"; client-supplied text is not proof. The admin reads
+    // the server's own records and decides. Only the admin moves
+    // a report; a dismissed report is never revealed to the
+    // reported member.
+    match /reports/{reportId} {
+      allow get: if request.auth != null
+        && (resource.data.reporter == request.auth.uid || hkIsAdmin());
+      allow list: if request.auth != null
+        && (resource.data.reporter == request.auth.uid || hkIsAdmin());
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['reporter', 'reported', 'pairId', 'reason', 'status', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['reporter', 'reported', 'pairId', 'threadId', 'proposalId', 'reason', 'note', 'status', 'createdAt'])
+        && request.resource.data.reporter == request.auth.uid
+        && request.resource.data.reported != request.auth.uid
+        && request.resource.data.reason is int
+        && request.resource.data.reason >= 1 && request.resource.data.reason <= 5
+        && request.resource.data.get('note', '').size() <= 100
+        && request.resource.data.status == 'open';
+        // NOTE: whether the reporter truly belongs to this pair
+        // is NOT checked here — a get() path cannot be built from
+        // request data. It does not need to be: a report is only a
+        // pointer (final-decision §3); the admin verifies the
+        // pair's real records before any decision, and a report
+        // from outside the pair is simply dismissed there.
+      allow update: if hkIsAdmin()
+        && request.resource.data.reporter == resource.data.reporter
+        && request.resource.data.reported == resource.data.reported
+        && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    // Sanctions (safety §5): written ONLY by the admin after a
+    // human review — no report ever auto-bans anyone. A sanction
+    // suspends only SENDING (proposals/invites); login, one's own
+    // book, and answering incoming proposals are never touched —
+    // those paths simply never consult this doc. The member can
+    // read their own sanction (its reason and dates feed the
+    // appeal screen).
+    match /sanctions/{uid} {
+      allow get: if request.auth != null && (request.auth.uid == uid || hkIsAdmin());
+      allow list: if hkIsAdmin();
+      allow create, update: if hkIsAdmin()
+        && request.resource.data.keys().hasAll(['level', 'reason', 'active', 'startsAt'])
+        && request.resource.data.level in ['warn', 'suspend7', 'suspend30', 'indefinite']
+        && (request.resource.data.get('endsAt', null) == null
+            || request.resource.data.endsAt is timestamp);
+      allow delete: if false;
+      // Sanction history: append-only, admin-written.
+      match /events/{eventId} {
+        allow get, list: if request.auth != null && (request.auth.uid == uid || hkIsAdmin());
+        allow create: if hkIsAdmin()
+          && request.resource.data.keys().hasAll(['type', 'by', 'at'])
+          && request.resource.data.at is timestamp;
+        allow update, delete: if false;
+      }
+    }
+
+    // Support & appeals (safety §6): one thread per request, the
+    // member and the admin inside it; messages are append-only,
+    // capped at 500 chars. Filing an appeal never forces contact
+    // with the person who blocked/reported anyone.
+    match /supportThreads/{threadId} {
+      allow get: if request.auth != null
+        && (resource.data.uid == request.auth.uid || hkIsAdmin());
+      allow list: if request.auth != null
+        && (resource.data.uid == request.auth.uid || hkIsAdmin());
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['uid', 'category', 'status', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'category', 'status', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.category in ['appeal', 'report-query', 'other']
+        && request.resource.data.status == 'open';
+      allow update: if hkIsAdmin()
+        || (request.auth != null
+            && resource.data.uid == request.auth.uid
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.status == 'closed'
+            && resource.data.status == 'open');
+      allow delete: if false;
+      match /messages/{messageId} {
+        allow get, list: if request.auth != null
+          && (get(/databases/$(database)/documents/supportThreads/$(threadId)).data.uid == request.auth.uid
+              || hkIsAdmin());
+        allow create: if request.auth != null
+          && request.resource.data.keys().hasAll(['from', 'text', 'at'])
+          && request.resource.data.keys().hasOnly(['from', 'text', 'at'])
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 500
+          && request.resource.data.at is timestamp
+          && ((get(/databases/$(database)/documents/supportThreads/$(threadId)).data.uid == request.auth.uid
+               && request.resource.data.from == 'user')
+              || (hkIsAdmin() && request.resource.data.from == 'admin'));
+        allow update, delete: if false;
+      }
+    }
+
+    // Daily send/search counters (safety §9.2): app-level by
+    // design — Rules cannot count a day. The doc exists so the
+    // numbers live server-side where the admin can audit them;
+    // writes are the owner's own and may only move upward.
+    match /sendCounts/{countId} {
+      allow get: if request.auth != null
+        && (resource.data.uid == request.auth.uid || hkIsAdmin());
+      allow list: if hkIsAdmin();
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['uid', 'date'])
+        && request.resource.data.uid == request.auth.uid
+        && countId == request.auth.uid + '_' + request.resource.data.date;
+      allow update: if request.auth != null
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.date == resource.data.date
+        && request.resource.data.get('proposals', 0) >= resource.data.get('proposals', 0)
+        && request.resource.data.get('invites', 0) >= resource.data.get('invites', 0)
+        && request.resource.data.get('searches', 0) >= resource.data.get('searches', 0);
+      allow delete: if false;
+    }
+  }
+}
